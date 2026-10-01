@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页阅读工具箱（高亮·批注·涂鸦）
 // @namespace    https://github.com/lilipps/reading-toolbox
-// @version      1.1.0
+// @version      1.2.0
 // @description  悬浮球拖拽展开工具栏，支持网页高亮、批注、涂鸦、橡皮擦、导出Markdown，绘画时锁定页面交互。
 // @author       lilipps
 // @match        *://*/*
@@ -853,20 +853,59 @@
 
     function genId() { return 'hl_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8); }
 
-    // 提取选区前后各30个字符的上下文
-    function getRangeContext(range) {
-        let before = '', after = '';
+    // 收集所有可读文本节点
+    function collectTextNodes() {
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+            acceptNode(node) {
+                if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+                const p = node.parentElement;
+                if (!p) return NodeFilter.FILTER_REJECT;
+                const tag = p.tagName;
+                if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEXTAREA') return NodeFilter.FILTER_REJECT;
+                if (p.closest('.rtb-hl-mark')) return NodeFilter.FILTER_REJECT;
+                if (p.closest('#rtb-host')) return NodeFilter.FILTER_REJECT;
+                return NodeFilter.FILTER_ACCEPT;
+            }
+        });
+        const list = [];
+        let n;
+        while ((n = walker.nextNode())) list.push(n);
+        return list;
+    }
+
+    // 计算某段文字在页面中是第几次出现（从 0 开始）
+    function computeOccurrenceIndex(range, target) {
         try {
-            const startNode = range.startContainer;
-            if (startNode.nodeType === Node.TEXT_NODE) {
-                before = startNode.nodeValue.slice(Math.max(0, range.startOffset - 30), range.startOffset);
+            const textNodes = collectTextNodes();
+            let fullText = '';
+            const nodeMap = [];
+            for (const node of textNodes) {
+                const start = fullText.length;
+                fullText += node.nodeValue;
+                nodeMap.push({ node, start, end: fullText.length });
             }
-            const endNode = range.endContainer;
-            if (endNode.nodeType === Node.TEXT_NODE) {
-                after = endNode.nodeValue.slice(range.endOffset, range.endOffset + 30);
+            // 找到 range 起点对应的全局偏移
+            let globalStart = -1;
+            for (const entry of nodeMap) {
+                if (entry.node === range.startContainer) {
+                    globalStart = entry.start + range.startOffset;
+                    break;
+                }
             }
-        } catch (e) {}
-        return { before, after };
+            if (globalStart < 0) return 0;
+            // 统计 globalStart 之前有多少个 target
+            let count = 0;
+            let searchPos = 0;
+            while (true) {
+                const idx = fullText.indexOf(target, searchPos);
+                if (idx < 0 || idx >= globalStart) break;
+                count++;
+                searchPos = idx + 1;
+            }
+            return count;
+        } catch (e) {
+            return 0;
+        }
     }
 
     function applyHighlight(color, note) {
@@ -876,13 +915,15 @@
         if (!text) return;
         const range = sel.getRangeAt(0);
         if (isInsideMark(range)) { sel.removeAllRanges(); hideSelToolbar(); return; }
-        const ctxInfo = getRangeContext(range);
+
+        // 计算这是第几次出现
+        const occurrenceIndex = computeOccurrenceIndex(range, text);
+
         const id = genId();
         const item = {
             id, url: location.href.split('#')[0], title: document.title,
             text, color, note: note || '', time: Date.now(),
-            contextBefore: ctxInfo.before,
-            contextAfter: ctxInfo.after
+            occurrenceIndex: occurrenceIndex
         };
         if (wrapRange(range, id, color)) {
             hlAdd(item); updateBadge();
@@ -912,13 +953,12 @@
             try {
                 const r = document.createRange();
                 r.setStart(n, idx); r.setEnd(n, idx + text.length);
-                const ctxInfo = getRangeContext(r);
+                const occurrenceIndex = computeOccurrenceIndex(r, text);
                 const id = genId();
                 const item = {
                     id, url: location.href.split('#')[0], title: document.title,
                     text, color, note: note || '', time: Date.now(),
-                    contextBefore: ctxInfo.before,
-                    contextAfter: ctxInfo.after
+                    occurrenceIndex: occurrenceIndex
                 };
                 if (wrapRange(r, id, color)) {
                     hlAdd(item); updateBadge();
@@ -980,34 +1020,19 @@
 
     // 在合并后的全文中查找某个偏移量所在的文本节点
     function findNodeAtOffset(nodeMap, offset) {
-        for (const entry of nodeMap) {
-            if (offset >= entry.start && offset <= entry.end) {
-                return entry;
-            }
+        for (let i = 0; i < nodeMap.length; i++) {
+            const entry = nodeMap[i];
+            if (offset >= entry.start && offset < entry.end) return entry;
+            if (i === nodeMap.length - 1 && offset === entry.end) return entry;
         }
         return null;
     }
 
-    // 支持上下文匹配，避免匹配到第一个出现的位置
+    // 根据「第几次出现」精确定位高亮
     function findAndWrap(item) {
         if (!item.text) return false;
 
-        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
-            acceptNode(node) {
-                if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
-                const p = node.parentElement;
-                if (!p) return NodeFilter.FILTER_REJECT;
-                const tag = p.tagName;
-                if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEXTAREA') return NodeFilter.FILTER_REJECT;
-                if (p.closest('.rtb-hl-mark')) return NodeFilter.FILTER_REJECT;
-                if (p.closest('#rtb-host')) return NodeFilter.FILTER_REJECT;
-                return NodeFilter.FILTER_ACCEPT;
-            }
-        });
-
-        const textNodes = [];
-        let n;
-        while ((n = walker.nextNode())) textNodes.push(n);
+        const textNodes = collectTextNodes();
         if (textNodes.length === 0) return false;
 
         let fullText = '';
@@ -1018,52 +1043,39 @@
             nodeMap.push({ node, start, end: fullText.length });
         }
 
-        const before = item.contextBefore || '';
-        const after = item.contextAfter || '';
         const target = item.text;
+        const targetOccurrence = item.occurrenceIndex || 0;
 
+        // 找到第 targetOccurrence 次出现的位置
         let matchStart = -1;
-        let matchEnd = -1;
-
-        // 策略1：before + text + after 完整匹配
-        if (before || after) {
-            const fullPattern = before + target + after;
-            const idx = fullText.indexOf(fullPattern);
-            if (idx >= 0) {
-                matchStart = idx + before.length;
-                matchEnd = matchStart + target.length;
-            }
+        let count = 0;
+        let searchPos = 0;
+        while (true) {
+            const idx = fullText.indexOf(target, searchPos);
+            if (idx < 0) break;
+            if (count === targetOccurrence) { matchStart = idx; break; }
+            count++;
+            searchPos = idx + 1;
         }
 
-        // 策略2：只使用 before + text 匹配
-        if (matchStart < 0 && before) {
-            const pattern = before + target;
-            const idx = fullText.indexOf(pattern);
-            if (idx >= 0) {
-                matchStart = idx + before.length;
-                matchEnd = matchStart + target.length;
-            }
-        }
-
-        // 策略3：回退到全文搜索（兼容旧数据）
+        // 按序号找不到（页面变了），回退到第一次出现
         if (matchStart < 0) {
-            const idx = fullText.indexOf(target);
-            if (idx >= 0) {
-                matchStart = idx;
-                matchEnd = matchStart + target.length;
-            }
+            matchStart = fullText.indexOf(target);
         }
-
         if (matchStart < 0) return false;
+        const matchEnd = matchStart + target.length;
+
+        const startInfo = findNodeAtOffset(nodeMap, matchStart);
+        const endInfo = findNodeAtOffset(nodeMap, matchEnd === fullText.length ? matchEnd - 1 : matchEnd);
+        if (!startInfo || !endInfo) return false;
+
+        const startOffset = matchStart - startInfo.start;
+        const endOffset = Math.min(matchEnd - endInfo.start, endInfo.node.nodeValue.length);
 
         try {
-            const startInfo = findNodeAtOffset(nodeMap, matchStart);
-            const endInfo = findNodeAtOffset(nodeMap, matchEnd);
-            if (!startInfo || !endInfo) return false;
-
             const r = document.createRange();
-            r.setStart(startInfo.node, matchStart - startInfo.start);
-            r.setEnd(endInfo.node, matchEnd - endInfo.start);
+            r.setStart(startInfo.node, startOffset);
+            r.setEnd(endInfo.node, endOffset);
             wrapRange(r, item.id, item.color);
             return true;
         } catch (e) {
